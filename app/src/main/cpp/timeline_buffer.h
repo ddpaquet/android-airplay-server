@@ -172,16 +172,20 @@ public:
     // packed: nests into AudioDebugData with fixed layout
     struct __attribute__((packed)) Debug {
         uint32_t trims, drops, silences, underruns;  // cumulative; 32-bit to avoid wrap
+        uint16_t peak;  // 0..1000 = loudest sample in the last read, for the visualizer
     };
 
     void countTrim()     { mTrims.fetch_add(1, std::memory_order_relaxed); }
     void countDrop()     { mDrops.fetch_add(1, std::memory_order_relaxed); }
     void countSilence()  { mSilences.fetch_add(1, std::memory_order_relaxed); }
     void countUnderrun() { mUnderruns.fetch_add(1, std::memory_order_relaxed); }
+    // level, not a counter: overwritten each read rather than accumulated
+    void notePeak(uint16_t p) { mPeak.store(p, std::memory_order_relaxed); }
 
     // any thread
     Debug debugInfo() const {
         Debug d{};
+        d.peak = mPeak.load(std::memory_order_relaxed);
         d.trims = mTrims.load(std::memory_order_relaxed);
         d.drops = mDrops.load(std::memory_order_relaxed);
         d.silences = mSilences.load(std::memory_order_relaxed);
@@ -190,6 +194,7 @@ public:
     }
 
 private:
+    std::atomic<uint16_t> mPeak{0};       // consumer->stats: last read's peak, 0..1000
     std::atomic<uint32_t> mTrims{0};      // backlog exceeded cap and was trimmed
     std::atomic<uint32_t> mDrops{0};      // late packets dropped, pts slot already passed
     std::atomic<uint32_t> mSilences{0};   // gaps filled with silence
@@ -213,7 +218,7 @@ public:
           // ring can't be reallocated mid-stream: size for worst-case backlog, i.e. cap
           // of largest reachable cushion + one throttle window of overshoot (trims are
           // throttled), 2x slack
-          mRing(2 * capOf(mTracker.ceil()) + (size_t)sampleRate * TRIM_THROTTLE_MS / 1000 * channels) {}
+          mRing(2 * capOf(mTracker.ceil()) + (size_t)sampleRate * TRIM_HEADROOM_MS / 1000 * channels) {}
 
     void noteOutputBufferFrames(int frames) { mTracker.noteOutputBufferFrames(frames); }
 
@@ -265,22 +270,36 @@ public:
         const int64_t now = monoNs();
 
         // bound latency: cap tracks tuned cushion live so a calmed link sheds latency
-        // without an underrun. each trim costs a glitch, so be conservative: trim only
-        // after backlog stayed above cap for TRIM_SUSTAIN (skip transient spikes), at
-        // most once per TRIM_THROTTLE, and not within that window of an underrun
-        // (trimming while rebuilding cushion is counterproductive)
+        // without an underrun. wait TRIM_SUSTAIN before reacting so a transient spike
+        // isn't chased, then shed the excess gradually (see below)
         const size_t avail = mRing.available();
         if (avail > capOf(tuned)) {
             if (mAboveCapSinceNs == 0) mAboveCapSinceNs = now;
         } else {
             mAboveCapSinceNs = 0;
         }
-        if (mAboveCapSinceNs != 0 && now - mAboveCapSinceNs >= TRIM_SUSTAIN_NS
-                && now - mLastTrimBlockNs >= TRIM_THROTTLE_NS) {
-            mRing.skip(avail - tuned);
-            mMetrics.countTrim();
-            mLastTrimBlockNs = now;
-            mAboveCapSinceNs = 0;
+        /*
+         * Shed excess gradually rather than in one lump. Dropping the whole overshoot
+         * at once is an audible jump forward; shaving TRIM_SLICE_MS per callback is not,
+         * and the backlog still converges on the cushion in well under a second.
+         *
+         * Deliberately NOT throttled against recent underruns. The old lump trim was,
+         * because trimming while rebuilding a cushion was destructive - but a gorged
+         * ring is itself caused by underruns (the reprime stops consumption while the
+         * producer keeps writing), so throttling on underrun disabled the correction
+         * exactly when it was needed. Each slice is small and self-limiting, and
+         * shaving stops the moment the backlog is back under cap.
+         */
+        if (mAboveCapSinceNs != 0 && now - mAboveCapSinceNs >= TRIM_SUSTAIN_NS) {
+            const size_t overshoot = avail - tuned;
+            // cap the per-callback slice so the correction is inaudible
+            const size_t maxSlice = (size_t)mSampleRate * TRIM_SLICE_MS / 1000 * mChannels;
+            const size_t slice = std::min(overshoot, maxSlice);
+            mRing.skip(slice);
+            if (slice == overshoot) {
+                mMetrics.countTrim();   // count the completed correction, not each slice
+                mAboveCapSinceNs = 0;   // back at target: stop shaving
+            }
         }
 
         // prebuffer: hold output until cushion fills, builds jitter headroom
@@ -306,12 +325,42 @@ public:
         }
 
         const size_t got = mRing.read(out, need);
+        // Peak of what is about to be played. Sampled rather than exhaustive: the
+        // visualizer only needs a level, and this runs on the realtime callback,
+        // so stride to keep the cost flat regardless of buffer size.
+        {
+            int32_t peak = 0;
+            const size_t stride = got > PEAK_SAMPLES ? got / PEAK_SAMPLES : 1;
+            for (size_t i = 0; i < got; i += stride) {
+                int32_t v = out[i];
+                if (v < 0) v = -v;
+                if (v > peak) peak = v;
+            }
+            mMetrics.notePeak((uint16_t)((int64_t)peak * 1000 / 32768));
+        }
         if (got < need) {
             memset(out + got, 0, (need - got) * sizeof(int16_t));
-            mPriming = true;
-            mLastTrimBlockNs = now;  // hold off trims while rebuilding
-            mUnderran.store(true, std::memory_order_relaxed);  // producer re-anchors
             mMetrics.countUnderrun();
+
+            /*
+             * A brief CPU stall starves us by a few ms. Repriming here used to stop
+             * consumption entirely until the cushion refilled, while the producer kept
+             * writing: the ring gorged well past capOf() and the next trim dumped
+             * hundreds of ms in one lump - an audible skip forward. So the recovery
+             * caused a far worse artifact than the hiccup it was recovering from.
+             *
+             * Instead ride out a short shortfall: the padded silence is inaudible at
+             * these sizes, and playback keeps draining so the backlog cannot balloon.
+             * Only a sustained shortfall (the stream really stopped) warrants a reprime
+             * and the producer re-anchor that goes with it.
+             */
+            if (++mShortReads >= SHORT_READS_TO_REPRIME) {
+                mPriming = true;
+                mUnderran.store(true, std::memory_order_relaxed);  // producer re-anchors
+                mShortReads = 0;
+            }
+        } else {
+            mShortReads = 0;  // a full read clears the streak
         }
     }
 
@@ -364,10 +413,19 @@ private:
 
     static constexpr int64_t SLACK_NS = 10'000'000LL;    // ignore <10ms gaps (NTP shift, rounding)
     static constexpr int64_t MAX_GAP_NS = 750'000'000LL; // >750ms = discontinuity, re-anchor
+    static constexpr size_t PEAK_SAMPLES = 64;           // samples inspected per read for the level
     static constexpr int TRIM_FLOOR_MS = 30;             // min trim point even for tiny cushion
-    static constexpr int TRIM_THROTTLE_MS = 2000;        // min spacing between trims, and after underrun
-    static constexpr int64_t TRIM_THROTTLE_NS = (int64_t)TRIM_THROTTLE_MS * 1'000'000LL;
-    static constexpr int TRIM_SUSTAIN_MS = 2000;         // backlog must exceed cap this long before trim
+    static constexpr int TRIM_SLICE_MS = 2;              // max backlog shaved per callback
+    // consecutive short reads before treating a shortfall as a real stream stop rather
+    // than a transient CPU stall. one read is ~1 oboe burst, so this is a few bursts.
+    static constexpr int SHORT_READS_TO_REPRIME = 8;
+    // headroom added to the ring size (see ctor); no longer a trim spacing, since
+    // shaving is gradual and unthrottled
+    static constexpr int TRIM_HEADROOM_MS = 2000;
+    // backlog must exceed cap this long before shaving starts. short, because each
+    // slice is inaudible: the old 2s wait suited a one-shot lump trim, but it lets the
+    // backlog keep climbing while a gradual correction is sitting on its hands
+    static constexpr int TRIM_SUSTAIN_MS = 250;
     static constexpr int64_t TRIM_SUSTAIN_NS = (int64_t)TRIM_SUSTAIN_MS * 1'000'000LL;
 
     const int mSampleRate;
@@ -377,7 +435,7 @@ private:
     TimelineMetrics mMetrics;
     bool mPriming = true;                // stream start: buffer output to build cushion
     uint32_t mPrimeSilenceFrames = 0;    // consumer-only: silence frames output while priming with partial data
-    int64_t mLastTrimBlockNs = 0;        // consumer-only: last trim/underrun time (trim throttle)
+    int mShortReads = 0;                 // consumer-only: consecutive short reads (underrun streak)
     int64_t mAboveCapSinceNs = 0;        // consumer-only: when backlog first exceeded cap (0 = under)
     std::atomic<bool> mUnderran{false};  // consumer->producer: underrun happened
 

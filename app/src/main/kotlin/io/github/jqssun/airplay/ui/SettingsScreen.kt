@@ -58,6 +58,8 @@ fun SettingsScreen(viewModel: MainViewModel) {
     val audioLatencyMs by viewModel.audioLatencyMs.collectAsState()
     val forceSwAlac by viewModel.forceSwAlac.collectAsState()
     val debugEnabled by viewModel.debugEnabled.collectAsState()
+    val visualizerEnabled by viewModel.visualizerEnabled.collectAsState()
+    val visualizerDelayS by viewModel.visualizerDelayS.collectAsState()
     val developerOptions by viewModel.developerOptions.collectAsState()
     val keyAllowFrameDrop by viewModel.keyAllowFrameDrop.collectAsState()
     val realtimeDecoderPriority by viewModel.realtimeDecoderPriority.collectAsState()
@@ -384,6 +386,35 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 range = 0..8192
             )
 
+
+            SettingSwitch(
+                title = stringResource(R.string.setting_visualizer),
+                description = stringResource(R.string.setting_visualizer_desc),
+                checked = visualizerEnabled,
+                onCheckedChange = { viewModel.setVisualizerEnabled(it) }
+            )
+
+            if (visualizerEnabled) {
+                var vizVal by remember(visualizerDelayS) { mutableFloatStateOf(visualizerDelayS.toFloat()) }
+                ListItem(
+                    headlineContent = {
+                        Slider(
+                            value = vizVal,
+                            onValueChange = { vizVal = it },
+                            onValueChangeFinished = { viewModel.setVisualizerDelayS(vizVal.roundToInt()) },
+                            valueRange = 5f..300f,
+                            steps = 58,
+                            modifier = Modifier.dpadFocus().dpadAdjust(
+                                onLeft = { viewModel.setVisualizerDelayS((visualizerDelayS - 5).coerceIn(5, 300)) },
+                                onRight = { viewModel.setVisualizerDelayS((visualizerDelayS + 5).coerceIn(5, 300)) }
+                            )
+                        )
+                    },
+                    trailingContent = {
+                        Text(stringResource(R.string.visualizer_delay_value, vizVal.roundToInt()))
+                    }
+                )
+            }
 
             SettingSwitch(
                 title = stringResource(R.string.setting_debug_overlay),

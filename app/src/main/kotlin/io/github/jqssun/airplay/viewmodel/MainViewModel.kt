@@ -40,6 +40,7 @@ data class AudioDebug(
     val decodeMaxUs: Int,
     val decodeHeld: Int,
     val decodeErrors: Int,
+    val peak: Int = 0,   // 0..1000 output level, drives the visualizer
 )
 
 data class DebugInfo(
@@ -179,6 +180,15 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
 
     private val _keepScreenOn = MutableStateFlow(prefs.getBoolean(Prefs.KEEP_SCREEN_ON, Prefs.DEF_KEEP_SCREEN_ON))
     val keepScreenOn: StateFlow<Boolean> = _keepScreenOn.asStateFlow()
+
+    private val _artFill = MutableStateFlow(prefs.getBoolean(Prefs.ART_FILL, Prefs.DEF_ART_FILL))
+    val artFill: StateFlow<Boolean> = _artFill.asStateFlow()
+    private val _visualizerEnabled =
+        MutableStateFlow(prefs.getBoolean(Prefs.VISUALIZER_ENABLED, Prefs.DEF_VISUALIZER_ENABLED))
+    val visualizerEnabled: StateFlow<Boolean> = _visualizerEnabled.asStateFlow()
+    private val _visualizerDelayS =
+        MutableStateFlow(prefs.getInt(Prefs.VISUALIZER_DELAY_S, Prefs.DEF_VISUALIZER_DELAY_S))
+    val visualizerDelayS: StateFlow<Int> = _visualizerDelayS.asStateFlow()
 
     private val _advertiseVideo = MutableStateFlow(prefs.getBoolean(Prefs.ADVERTISE_VIDEO, Prefs.DEF_ADVERTISE_VIDEO))
     val advertiseVideo: StateFlow<Boolean> = _advertiseVideo.asStateFlow()
@@ -403,6 +413,21 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
     fun setIdlePreview(v: Boolean) { _idlePreview.value = v; prefs.edit().putBoolean(Prefs.IDLE_PREVIEW, v).apply() }
     fun setAutoFullscreen(v: Boolean) { _autoFullscreen.value = v; prefs.edit().putBoolean(Prefs.AUTO_FULLSCREEN, v).apply() }
     fun setKeepScreenOn(v: Boolean) { _keepScreenOn.value = v; prefs.edit().putBoolean(Prefs.KEEP_SCREEN_ON, v).apply() }
+    fun setArtFill(v: Boolean) { _artFill.value = v; prefs.edit().putBoolean(Prefs.ART_FILL, v).apply() }
+    fun setVisualizerEnabled(v: Boolean) {
+        _visualizerEnabled.value = v; prefs.edit().putBoolean(Prefs.VISUALIZER_ENABLED, v).apply()
+    }
+    fun setVisualizerDelayS(v: Int) {
+        _visualizerDelayS.value = v; prefs.edit().putInt(Prefs.VISUALIZER_DELAY_S, v).apply()
+    }
+
+    // Output level 0..1 for the visualizer. Polled directly rather than routed
+    // through debugInfo, which only updates while the debug overlay is enabled
+    // and at a rate far too slow to animate.
+    fun audioLevel(): Float {
+        val peak = service?.audioRenderer?.audioDebug()?.peak ?: return 0f
+        return (peak / 1000f).coerceIn(0f, 1f)
+    }
     fun setAdvertiseVideo(v: Boolean) { _advertiseVideo.value = v; prefs.edit().putBoolean(Prefs.ADVERTISE_VIDEO, v).apply(); _applyByServerRestart() }
     fun setAdvertiseAudio(v: Boolean) { _advertiseAudio.value = v; prefs.edit().putBoolean(Prefs.ADVERTISE_AUDIO, v).apply(); _applyByServerRestart() }
     fun setLaunchOnConnect(v: Boolean) { _launchOnConnect.value = v; prefs.edit().putBoolean(Prefs.LAUNCH_ON_CONNECT, v).apply() }

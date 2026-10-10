@@ -46,4 +46,10 @@ object Prefs {
     const val ADVERTISE_VIDEO = "advertise_video"; const val DEF_ADVERTISE_VIDEO = true
     const val ADVERTISE_AUDIO = "advertise_audio"; const val DEF_ADVERTISE_AUDIO = true
     const val LAUNCH_ON_CONNECT = "launch_on_connect"; const val DEF_LAUNCH_ON_CONNECT = true
+    // cover art fills the media area (crop) vs shows whole (letterboxed)
+    const val ART_FILL = "art_fill"; const val DEF_ART_FILL = true
+    // screensaver-style audio visualizer, to keep static art off an OLED panel
+    const val VISUALIZER_ENABLED = "visualizer_enabled"; const val DEF_VISUALIZER_ENABLED = true
+    // idle seconds before the visualizer takes over; 0 disables the timeout
+    const val VISUALIZER_DELAY_S = "visualizer_delay_s"; const val DEF_VISUALIZER_DELAY_S = 15
 }

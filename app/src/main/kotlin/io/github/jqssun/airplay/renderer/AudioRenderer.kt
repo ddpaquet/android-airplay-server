@@ -68,13 +68,15 @@ class AudioRenderer {
         val drops = buf.int
         val silences = buf.int
         val underruns = buf.int
+        // uint16 appended to the timeline struct; must be read here to stay aligned
+        val peak = buf.short.toInt() and 0xFFFF
         val meanUs = buf.int
         val maxUs = buf.int
         val held = buf.short.toInt() and 0xFFFF
         val xrun = buf.int
         val decodeErrors = buf.int
         return AudioDebug(backlogMs, tunedCushionMs, trims, drops, silences, underruns, xrun,
-                          meanUs, maxUs, held, decodeErrors)
+                          meanUs, maxUs, held, decodeErrors, peak)
     }
 
     @Synchronized
@@ -86,7 +88,7 @@ class AudioRenderer {
     }
 
     companion object {
-        // must be >= native sizeof(AudioDebugData) (38 B)
+        // must be >= native sizeof(AudioDebugData) (40 B)
         private const val DEBUG_BUF_BYTES = 64
         const val CT_ALAC = 2
         const val CT_AAC_LC = 4

@@ -12,7 +12,10 @@ val localProps = Properties().apply {
     rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use(::load)
 }
 
-val allAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+// override in local.properties (e.g. abiFilters=arm64-v8a) to skip building
+// the native deps for ABIs you aren't deploying to
+val allAbis = (localProps.getProperty("abiFilters") ?: "arm64-v8a,armeabi-v7a,x86_64")
+    .split(",").map(String::trim).filter(String::isNotEmpty)
 
 android {
     namespace = "io.github.jqssun.airplay"
